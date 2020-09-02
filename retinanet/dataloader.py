@@ -1,4 +1,5 @@
 from __future__ import print_function, division
+from midas.midas_net import SuperMidas
 import sys
 import os
 import torch
@@ -34,7 +35,7 @@ class CocoDataset(Dataset):
         self.set_name = set_name
         self.transform = transform
 
-        self.coco      = COCO(os.path.join(self.root_dir, 'annotations', 'instances_' + self.set_name + '.json'))
+        self.coco = COCO(os.path.join(self.root_dir, 'annotations', 'instances_' + self.set_name + '.json'))
         self.image_ids = self.coco.getImgIds()
 
         self.load_classes()
@@ -44,8 +45,8 @@ class CocoDataset(Dataset):
         categories = self.coco.loadCats(self.coco.getCatIds())
         categories.sort(key=lambda x: x['id'])
 
-        self.classes             = {}
-        self.coco_labels         = {}
+        self.classes = {}
+        self.coco_labels = {}
         self.coco_labels_inverse = {}
         for c in categories:
             self.coco_labels[len(self.classes)] = c['id']
@@ -72,7 +73,7 @@ class CocoDataset(Dataset):
 
     def load_image(self, image_index):
         image_info = self.coco.loadImgs(self.image_ids[image_index])[0]
-        path       = os.path.join(self.root_dir, 'images', self.set_name, image_info['file_name'])
+        path = os.path.join(self.root_dir, 'images', self.set_name, image_info['file_name'])
         img = skimage.io.imread(path)
 
         if len(img.shape) == 2:
@@ -83,7 +84,7 @@ class CocoDataset(Dataset):
     def load_annotations(self, image_index):
         # get ground truth annotations
         annotations_ids = self.coco.getAnnIds(imgIds=self.image_ids[image_index], iscrowd=False)
-        annotations     = np.zeros((0, 5))
+        annotations = np.zeros((0, 5))
 
         # some images appear to miss annotations (like image with id 257034)
         if len(annotations_ids) == 0:
@@ -97,10 +98,10 @@ class CocoDataset(Dataset):
             if a['bbox'][2] < 1 or a['bbox'][3] < 1:
                 continue
 
-            annotation        = np.zeros((1, 5))
+            annotation = np.zeros((1, 5))
             annotation[0, :4] = a['bbox']
-            annotation[0, 4]  = self.coco_label_to_label(a['category_id'])
-            annotations       = np.append(annotations, annotation, axis=0)
+            annotation[0, 4] = self.coco_label_to_label(a['category_id'])
+            annotations = np.append(annotations, annotation, axis=0)
 
         # transform from [x, y, w, h] to [x1, y1, x2, y2]
         annotations[:, 2] = annotations[:, 0] + annotations[:, 2]
@@ -111,6 +112,109 @@ class CocoDataset(Dataset):
     def coco_label_to_label(self, coco_label):
         return self.coco_labels_inverse[coco_label]
 
+    def label_to_coco_label(self, label):
+        return self.coco_labels[label]
+
+    def image_aspect_ratio(self, image_index):
+        image = self.coco.loadImgs(self.image_ids[image_index])[0]
+        return float(image['width']) / float(image['height'])
+
+    def num_classes(self):
+        return 80
+
+
+class CocoDatasetDepthLive(Dataset):
+    """Coco dataset."""
+
+    def __init__(self, root_dir, set_name='train2017', transform=None):
+        """
+        Args:
+            root_dir (string): COCO directory.
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        self.root_dir = root_dir
+        self.set_name = set_name
+        self.transform = transform
+
+        self.coco = COCO(os.path.join(self.root_dir, 'annotations', 'instances_' + self.set_name + '.json'))
+        self.image_ids = self.coco.getImgIds()
+
+        self.load_classes()
+
+        self.predictor = SuperMidas.build_from_model_path('/home/daniele/work/workspace_python/MiDaS-private/model-f46da743.pt')
+
+    def load_classes(self):
+        # load class names (name -> label)
+        categories = self.coco.loadCats(self.coco.getCatIds())
+        categories.sort(key=lambda x: x['id'])
+
+        self.classes = {}
+        self.coco_labels = {}
+        self.coco_labels_inverse = {}
+        for c in categories:
+            self.coco_labels[len(self.classes)] = c['id']
+            self.coco_labels_inverse[c['id']] = len(self.classes)
+            self.classes[c['name']] = len(self.classes)
+
+        # also load the reverse (label -> name)
+        self.labels = {}
+        for key, value in self.classes.items():
+            self.labels[value] = key
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+
+        img = self.load_image(idx)
+        depth = self.predictor(img)
+        annot = self.load_annotations(idx)
+        sample = {'img': img, 'annot': annot, 'depth': depth}
+        if self.transform:
+            sample = self.transform(sample)
+        return sample
+
+    def load_image(self, image_index):
+        image_info = self.coco.loadImgs(self.image_ids[image_index])[0]
+        path = os.path.join(self.root_dir, 'images', self.set_name, image_info['file_name'])
+        img = skimage.io.imread(path)
+
+        if len(img.shape) == 2:
+            img = skimage.color.gray2rgb(img)
+
+        return img.astype(np.float32)/255.0
+
+    def load_annotations(self, image_index):
+        # get ground truth annotations
+        annotations_ids = self.coco.getAnnIds(imgIds=self.image_ids[image_index], iscrowd=False)
+        annotations = np.zeros((0, 5))
+
+        # some images appear to miss annotations (like image with id 257034)
+        if len(annotations_ids) == 0:
+            return annotations
+
+        # parse annotations
+        coco_annotations = self.coco.loadAnns(annotations_ids)
+        for idx, a in enumerate(coco_annotations):
+
+            # some annotations have basically no width / height, skip them
+            if a['bbox'][2] < 1 or a['bbox'][3] < 1:
+                continue
+
+            annotation = np.zeros((1, 5))
+            annotation[0, :4] = a['bbox']
+            annotation[0, 4] = self.coco_label_to_label(a['category_id'])
+            annotations = np.append(annotations, annotation, axis=0)
+
+        # transform from [x, y, w, h] to [x1, y1, x2, y2]
+        annotations[:, 2] = annotations[:, 0] + annotations[:, 2]
+        annotations[:, 3] = annotations[:, 1] + annotations[:, 3]
+
+        return annotations
+
+    def coco_label_to_label(self, coco_label):
+        return self.coco_labels_inverse[coco_label]
 
     def label_to_coco_label(self, label):
         return self.coco_labels[label]
@@ -220,7 +324,7 @@ class CSVDataset(Dataset):
     def load_annotations(self, image_index):
         # get ground truth annotations
         annotation_list = self.image_data[self.image_names[image_index]]
-        annotations     = np.zeros((0, 5))
+        annotations = np.zeros((0, 5))
 
         # some images appear to miss annotations (like image with id 257034)
         if len(annotation_list) == 0:
@@ -237,15 +341,15 @@ class CSVDataset(Dataset):
             if (x2-x1) < 1 or (y2-y1) < 1:
                 continue
 
-            annotation        = np.zeros((1, 5))
-            
+            annotation = np.zeros((1, 5))
+
             annotation[0, 0] = x1
             annotation[0, 1] = y1
             annotation[0, 2] = x2
             annotation[0, 3] = y2
 
-            annotation[0, 4]  = self.name_to_label(a['class'])
-            annotations       = np.append(annotations, annotation, axis=0)
+            annotation[0, 4] = self.name_to_label(a['class'])
+            annotations = np.append(annotations, annotation, axis=0)
 
         return annotations
 
@@ -303,7 +407,7 @@ def collater(data):
     imgs = [s['img'] for s in data]
     annots = [s['annot'] for s in data]
     scales = [s['scale'] for s in data]
-        
+
     widths = [int(s.shape[0]) for s in imgs]
     heights = [int(s.shape[1]) for s in imgs]
     batch_size = len(imgs)
@@ -318,23 +422,65 @@ def collater(data):
         padded_imgs[i, :int(img.shape[0]), :int(img.shape[1]), :] = img
 
     max_num_annots = max(annot.shape[0] for annot in annots)
-    
+
     if max_num_annots > 0:
 
         annot_padded = torch.ones((len(annots), max_num_annots, 5)) * -1
 
         if max_num_annots > 0:
             for idx, annot in enumerate(annots):
-                #print(annot.shape)
+                # print(annot.shape)
                 if annot.shape[0] > 0:
                     annot_padded[idx, :annot.shape[0], :] = annot
     else:
         annot_padded = torch.ones((len(annots), 1, 5)) * -1
 
-
     padded_imgs = padded_imgs.permute(0, 3, 1, 2)
 
     return {'img': padded_imgs, 'annot': annot_padded, 'scale': scales}
+
+
+def collater_depths(data):
+
+    imgs = [s['img'] for s in data]
+    annots = [s['annot'] for s in data]
+    scales = [s['scale'] for s in data]
+    depths = [s['depth'] for s in data]
+
+    widths = [int(s.shape[0]) for s in imgs]
+    heights = [int(s.shape[1]) for s in imgs]
+    batch_size = len(imgs)
+
+    max_width = np.array(widths).max()
+    max_height = np.array(heights).max()
+
+    padded_imgs = torch.zeros(batch_size, max_width, max_height, 3)
+    padded_depths = torch.zeros(batch_size, max_width, max_height)
+
+    for i in range(batch_size):
+        img = imgs[i]
+        padded_imgs[i, :int(img.shape[0]), :int(img.shape[1]), :] = img
+        depth = depths[i]
+        padded_depths[i, :int(depth.shape[0]), :int(depth.shape[1])] = depth
+
+    max_num_annots = max(annot.shape[0] for annot in annots)
+
+    if max_num_annots > 0:
+
+        annot_padded = torch.ones((len(annots), max_num_annots, 5)) * -1
+
+        if max_num_annots > 0:
+            for idx, annot in enumerate(annots):
+                # print(annot.shape)
+                if annot.shape[0] > 0:
+                    annot_padded[idx, :annot.shape[0], :] = annot
+    else:
+        annot_padded = torch.ones((len(annots), 1, 5)) * -1
+
+    padded_imgs = padded_imgs.permute(0, 3, 1, 2)
+
+    return {'img': padded_imgs, 'annot': annot_padded, 'scale': scales, 'depth': padded_depths}
+
 
 class Resizer(object):
     """Convert ndarrays in sample to Tensors."""
@@ -360,8 +506,8 @@ class Resizer(object):
         image = skimage.transform.resize(image, (int(round(rows*scale)), int(round((cols*scale)))))
         rows, cols, cns = image.shape
 
-        pad_w = 32 - rows%32
-        pad_h = 32 - cols%32
+        pad_w = 32 - rows % 32
+        pad_h = 32 - cols % 32
 
         new_image = np.zeros((rows + pad_w, cols + pad_h, cns)).astype(np.float32)
         new_image[:rows, :cols, :] = image.astype(np.float32)
@@ -369,6 +515,50 @@ class Resizer(object):
         annots[:, :4] *= scale
 
         return {'img': torch.from_numpy(new_image), 'annot': torch.from_numpy(annots), 'scale': scale}
+
+
+class ResizerDepth(object):
+    """Convert ndarrays in sample to Tensors."""
+
+    def __call__(self, sample, min_side=608, max_side=1024):
+        image, annots, depth = sample['img'], sample['annot'], sample['depth']
+
+        rows, cols, cns = image.shape
+
+        smallest_side = min(rows, cols)
+
+        # rescale the image so the smallest side is min_side
+        scale = min_side / smallest_side
+
+        # check if the largest side is now greater than max_side, which can happen
+        # when images have a large aspect ratio
+        largest_side = max(rows, cols)
+
+        if largest_side * scale > max_side:
+            scale = max_side / largest_side
+
+        # resize the image with the computed scale
+        image = skimage.transform.resize(image, (int(round(rows*scale)), int(round((cols*scale)))))
+        depth = skimage.transform.resize(depth, (int(round(rows*scale)), int(round((cols*scale)))))
+        rows, cols, cns = image.shape
+
+        pad_w = 32 - rows % 32
+        pad_h = 32 - cols % 32
+
+        new_image = np.zeros((rows + pad_w, cols + pad_h, cns)).astype(np.float32)
+        new_image[:rows, :cols, :] = image.astype(np.float32)
+
+        new_depth = np.zeros((rows + pad_w, cols + pad_h)).astype(np.float32)
+        new_depth[:rows, :cols] = depth.astype(np.float32)
+
+        annots[:, :4] *= scale
+
+        return {
+            'img': torch.from_numpy(new_image),
+            'annot': torch.from_numpy(annots),
+            'scale': scale,
+            'depth': torch.from_numpy(new_depth)
+        }
 
 
 class Augmenter(object):
@@ -384,13 +574,38 @@ class Augmenter(object):
 
             x1 = annots[:, 0].copy()
             x2 = annots[:, 2].copy()
-            
+
             x_tmp = x1.copy()
 
             annots[:, 0] = cols - x2
             annots[:, 2] = cols - x_tmp
 
             sample = {'img': image, 'annot': annots}
+
+        return sample
+
+
+class AugmenterDepth(object):
+    """Convert ndarrays in sample to Tensors."""
+
+    def __call__(self, sample, flip_x=0.5):
+
+        if np.random.rand() < flip_x:
+            image, annots, depth = sample['img'], sample['annot'], sample['depth']
+            image = image[:, ::-1, :]
+            depth = depth[:, ::-1]
+
+            rows, cols, channels = image.shape
+
+            x1 = annots[:, 0].copy()
+            x2 = annots[:, 2].copy()
+
+            x_tmp = x1.copy()
+
+            annots[:, 0] = cols - x2
+            annots[:, 2] = cols - x_tmp
+
+            sample = {'img': image, 'annot': annots, 'depth': depth}
 
         return sample
 
@@ -405,7 +620,25 @@ class Normalizer(object):
 
         image, annots = sample['img'], sample['annot']
 
-        return {'img':((image.astype(np.float32)-self.mean)/self.std), 'annot': annots}
+        return {'img': ((image.astype(np.float32)-self.mean)/self.std), 'annot': annots}
+
+
+class NormalizerDepth(object):
+
+    def __init__(self):
+        self.mean = np.array([[[0.485, 0.456, 0.406]]])
+        self.std = np.array([[[0.229, 0.224, 0.225]]])
+
+    def __call__(self, sample):
+
+        image, annots = sample['img'], sample['annot']
+
+        return {
+            'img': ((image.astype(np.float32)-self.mean)/self.std),
+            'annot': annots,
+            'depth': sample['depth']
+        }
+
 
 class UnNormalizer(object):
     def __init__(self, mean=None, std=None):
